@@ -8,24 +8,36 @@ import { traceable } from "langsmith/traceable";
 
 export class AzureAIInferenceModel extends BaseModel {
     private readonly debug = createDebugMessages('embedjs:model:AzureAIInference');
-
+    private readonly modelName: string;
     private readonly maxNewTokens: number;
     private readonly endpointUrl?: string;
     private readonly apiKey?: string;
     private model: any;
 
-    constructor(params?: { temperature?: number; maxNewTokens?: number; endpointUrl?: string; apiKey?: string }) {
+    constructor(params?: { modelName?: string; temperature?: number; maxNewTokens?: number; endpointUrl?: string; apiKey?: string }) {
         super(params?.temperature);
-
+        this.modelName = params?.modelName ?? 'Meta-Llama-3-70B-Instruct';
         this.endpointUrl = params?.endpointUrl;
         this.apiKey = params?.apiKey;
         this.maxNewTokens = params?.maxNewTokens ?? 300;
     }
 
     override async init(): Promise<void> {
+        if (!this.endpointUrl) {
+            throw new Error('Azure AI endpoint URL is missing.');
+        }
+
+        if (!this.apiKey) {
+            throw new Error('Azure AI API key is missing.');
+        }
+
         this.model = ModelClient(
             this.endpointUrl,
-            new AzureKeyCredential(this.apiKey));
+            new AzureKeyCredential(this.apiKey),
+            {
+                allowInsecureConnection: true // to allow non https conncetions 
+            }
+        );
     }
 
     override async runQuery(
@@ -71,13 +83,13 @@ export class AzureAIInferenceModel extends BaseModel {
         });
 
         const finalPrompt = pastMessages
-       
-        this.debug(`Executing Azure AI Inference '${this.endpointUrl}' model with prompt -`, userQuery);
+        this.debug(`Executing Azure AI Inference '${this.modelName}' model with prompt -`, userQuery);
 
         const chatModel = traceable(
             async ({ messages }: { messages: { role: string; content: string }[] }) => {
                 const response = await this.model.path("chat/completions").post({
                     body: {
+                        model: this.modelName,
                         messages: messages,
                         max_tokens: this.maxNewTokens,
                         temperature: this.temperature
