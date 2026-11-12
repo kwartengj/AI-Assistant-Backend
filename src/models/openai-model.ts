@@ -25,12 +25,12 @@ export class OpenAi extends BaseModel {
         this.model = new ChatOpenAI({ temperature: this.temperature, model: this.modelName, apiKey : this.apiKey }, this.baseURL ? { baseURL: this.baseURL } : {});
     }
 
-    override async runQuery(
+    private buildMessages(
         system: string,
         userQuery: string,
         supportingContext: Chunk[],
         pastConversations: Message[],
-    ): Promise<string> {
+    ): (AIMessage | SystemMessage | HumanMessage)[] {
         const pastMessages: (AIMessage | SystemMessage | HumanMessage)[] = [new SystemMessage(system)];
         pastMessages.push(
             new SystemMessage(`Supporting context: ${supportingContext.map((s) => s.pageContent).join('; ')}`),
@@ -45,10 +45,36 @@ export class OpenAi extends BaseModel {
             }),
         );
         pastMessages.push(new HumanMessage(`${userQuery}?`));
+        return pastMessages;
+    }
+
+    override async runQuery(
+        system: string,
+        userQuery: string,
+        supportingContext: Chunk[],
+        pastConversations: Message[],
+    ): Promise<string> {
+        const pastMessages = this.buildMessages(system, userQuery, supportingContext, pastConversations);
 
         this.debug('Executing openai model with prompt -', userQuery);
         const result = await this.model.invoke(pastMessages);
         this.debug('OpenAI response -', result);
         return result.content.toString();
+    }
+
+    override async *runQueryStream(
+        system: string,
+        userQuery: string,
+        supportingContext: Chunk[],
+        pastConversations: Message[],
+    ): AsyncGenerator<string, void, undefined> {
+        const pastMessages = this.buildMessages(system, userQuery, supportingContext, pastConversations);
+
+        this.debug('Streaming openai model with prompt -', userQuery);
+        const stream = await this.model.stream(pastMessages);
+        for await (const chunk of stream) {
+            const text = typeof chunk.content === 'string' ? chunk.content : chunk.content.map((c: any) => c?.text ?? '').join('');
+            if (text) yield text;
+        }
     }
 }

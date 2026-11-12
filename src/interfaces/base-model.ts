@@ -1,6 +1,6 @@
 import createDebugMessages from 'debug';
 import { v4 as uuidv4 } from 'uuid';
-import { Chunk, Message, ConversationEntry, Sources } from '../global/types.js';
+import { Chunk, Message, ConversationEntry, Sources, QueryStreamEvent } from '../global/types.js';
 import { BaseConversations } from './base-conversations.js';
 
 export abstract class BaseModel {
@@ -49,6 +49,52 @@ export abstract class BaseModel {
 
         const result = await this.runQuery(system, userQuery, supportingContext, pastConversations, userId, instanceId);
 
+        return this.saveExchange(conversationId, userQuery, result, uniqueSources, chunksIds);
+    }
+
+    /**
+     * Streaming version of `query`. Yields `{ type: 'token', text }` for each piece of the answer as the
+     * model generates it. Once the answer is complete, the user query and the full answer are saved to the
+     * conversation (exactly as `query` does) and a final `{ type: 'done', entry }` event is yielded.
+     *
+     * If the consumer stops iterating early (e.g. the client disconnected), nothing is saved.
+     */
+    public async *queryStream(
+        system: string,
+        userQuery: string,
+        supportingContext: Chunk[],
+        conversationId: string = 'default',
+        userId?: string,
+        instanceId?: string
+    ): AsyncGenerator<QueryStreamEvent, void, undefined> {
+        const conversation = await BaseModel.conversations.getConversation(conversationId);
+        this.baseDebug(`${conversation.entries.length} history entries found for conversationId '${conversationId}' (streaming)`);
+
+        const uniqueSources = this.extractUniqueSources(supportingContext);
+        const chunksIds = this.extractChunkIds(supportingContext);
+        const pastConversations = conversation.entries.map(entry => entry.content);
+
+        let result = '';
+        for await (const text of this.runQueryStream(system, userQuery, supportingContext, pastConversations, userId, instanceId)) {
+            if (!text) continue;
+            result += text;
+            yield { type: 'token', text };
+        }
+
+        const entry = await this.saveExchange(conversationId, userQuery, result, uniqueSources, chunksIds);
+        yield { type: 'done', entry };
+    }
+
+    /**
+     * Adds the user query and the AI answer to the conversation history and returns the AI entry.
+     */
+    private async saveExchange(
+        conversationId: string,
+        userQuery: string,
+        answer: string,
+        sources: Sources[],
+        chunkIds: string[],
+    ): Promise<ConversationEntry> {
         // Add user query to history
         await BaseModel.conversations.addEntryToConversation(conversationId, {
             _id: uuidv4(),
@@ -66,10 +112,10 @@ export abstract class BaseModel {
             timestamp: new Date(),
             content: {
                 sender: "AI",
-                message: result
+                message: answer
             },
-            sources: uniqueSources,
-            chunks: chunksIds
+            sources,
+            chunks: chunkIds
         }
         // Add AI response to history
         await BaseModel.conversations.addEntryToConversation(conversationId, newEntry);
@@ -146,4 +192,21 @@ export abstract class BaseModel {
         userId?: string,
         instanceId?: string,
     ): Promise<any>;
+
+    /**
+     * Yields the answer text piece by piece. Models that support streaming override this; the default
+     * runs the normal (non-streaming) query and yields the whole answer as a single piece, so
+     * `queryStream` works with every model.
+     */
+    protected async *runQueryStream(
+        system: string,
+        userQuery: string,
+        supportingContext: Chunk[],
+        pastConversations: Message[],
+        userId?: string,
+        instanceId?: string,
+    ): AsyncGenerator<string, void, undefined> {
+        const result = await this.runQuery(system, userQuery, supportingContext, pastConversations, userId, instanceId);
+        yield typeof result === 'string' ? result : String(result ?? '');
+    }
 }

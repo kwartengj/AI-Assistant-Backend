@@ -2,7 +2,7 @@ import createDebugMessages from 'debug';
 
 import { BaseDb } from '../interfaces/base-db.js';
 import { BaseLoader } from '../interfaces/base-loader.js';
-import { AddLoaderReturn, Chunk, InsertChunkData, LoaderChunk, ConversationEntry } from '../global/types.js';
+import { AddLoaderReturn, Chunk, InsertChunkData, LoaderChunk, ConversationEntry, QueryStreamEvent } from '../global/types.js';
 import { DynamicLoader, LoaderParam } from './dynamic-loader-selector.js';
 import { RAGApplicationBuilder } from './rag-application-builder.js';
 import { DEFAULT_INSERT_BATCH_SIZE } from '../global/constants.js';
@@ -379,6 +379,39 @@ export class RAGApplication {
         var result = await this.model.query(this.queryTemplate, userQuery, context, conversationId, userId, instanceId);
 
         return result;
+    }
+
+    /**
+     * Streaming version of `query`. Yields `{ type: 'token', text }` events as the answer is generated,
+     * then one `{ type: 'done', entry }` event once the query and full answer have been saved to the
+     * conversation. `entry` is the same object `query` would have returned.
+     *
+     * @example
+     * for await (const event of ragApplication.queryStream(question, conversationId, chunks)) {
+     *     if (event.type === 'token') process.stdout.write(event.text);
+     *     else console.log('\nSaved entry', event.entry._id);
+     * }
+     */
+    public async *queryStream(
+        userQuery: string,
+        conversationId?: string,
+        context?: Chunk[],
+        userId?: string,
+        instanceId?: string
+    ): AsyncGenerator<QueryStreamEvent, void, undefined> {
+        if (!this.model) {
+            throw new Error('LLM Not set; query method not available');
+        }
+
+        if (!context) {
+            context = await this.getContext(userQuery);
+        }
+        const sources = [...new Set(context.map((chunk) => chunk.metadata.source))];
+        this.debug(
+            `Streaming query with ${context.length} chunks from ${sources.length} unique sources.`,
+        );
+
+        yield* this.model.queryStream(this.queryTemplate, userQuery, context, conversationId, userId, instanceId);
     }
 
      /**

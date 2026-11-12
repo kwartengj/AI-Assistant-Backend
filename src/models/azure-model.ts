@@ -6,6 +6,8 @@ import { Chunk, Message } from '../global/types.js';
 import { AzureKeyCredential } from '@azure/core-auth';
 import { traceable } from "langsmith/traceable";
 
+type ChatMessage = { role: string; content: string };
+
 export class AzureAIInferenceModel extends BaseModel {
     private readonly debug = createDebugMessages('embedjs:model:AzureAIInference');
     private readonly modelName: string;
@@ -35,32 +37,30 @@ export class AzureAIInferenceModel extends BaseModel {
             this.endpointUrl,
             new AzureKeyCredential(this.apiKey),
             {
-                allowInsecureConnection: true // to allow non https conncetions 
+                allowInsecureConnection: true // to allow non https conncetions
             }
         );
     }
 
-    override async runQuery(
+    private buildMessages(
         system: string,
         userQuery: string,
         supportingContext: Chunk[],
         pastConversations: Message[],
-        userId?: string,
-        instanceId?: string,
-    ): Promise<string> {
-        const pastMessages = [
+    ): ChatMessage[] {
+        const messages: ChatMessage[] = [
             {
                 role: "system",
                 content: system
             }
         ];
-        pastMessages.push({
+        messages.push({
             role: "system",
             content: `Data: ${supportingContext.map((s) => s.pageContent).join('; ')}`
         });
 
-        pastMessages.push.apply(
-            pastMessages,
+        messages.push.apply(
+            messages,
             pastConversations.map((c) => {
                 if (c.sender === 'AI') return {
                     role: "assistant",
@@ -77,16 +77,27 @@ export class AzureAIInferenceModel extends BaseModel {
             }),
         );
 
-        pastMessages.push({
+        messages.push({
             role: "user",
             content: userQuery
         });
 
-        const finalPrompt = pastMessages
+        return messages;
+    }
+
+    override async runQuery(
+        system: string,
+        userQuery: string,
+        supportingContext: Chunk[],
+        pastConversations: Message[],
+        userId?: string,
+        instanceId?: string,
+    ): Promise<string> {
+        const finalPrompt = this.buildMessages(system, userQuery, supportingContext, pastConversations);
         this.debug(`Executing Azure AI Inference '${this.modelName}' model with prompt -`, userQuery);
 
         const chatModel = traceable(
-            async ({ messages }: { messages: { role: string; content: string }[] }) => {
+            async ({ messages }: { messages: ChatMessage[] }) => {
                 const response = await this.model.path("chat/completions").post({
                     body: {
                         model: this.modelName,
@@ -111,4 +122,101 @@ export class AzureAIInferenceModel extends BaseModel {
         this.debug('Azure response -', result);
         return result;
     }
+
+    override async *runQueryStream(
+        system: string,
+        userQuery: string,
+        supportingContext: Chunk[],
+        pastConversations: Message[],
+        userId?: string,
+        instanceId?: string,
+    ): AsyncGenerator<string, void, undefined> {
+        const finalPrompt = this.buildMessages(system, userQuery, supportingContext, pastConversations);
+        this.debug(`Streaming Azure AI Inference '${this.modelName}' model with prompt -`, userQuery);
+
+        const client = this.model;
+        const modelName = this.modelName;
+        const maxTokens = this.maxNewTokens;
+        const temperature = this.temperature;
+
+        const streamChat = traceable(
+            async function* ({ messages }: { messages: ChatMessage[] }): AsyncGenerator<string, void, undefined> {
+                const response = await client.path("chat/completions").post({
+                    body: {
+                        model: modelName,
+                        messages: messages,
+                        max_tokens: maxTokens,
+                        temperature: temperature,
+                        stream: true
+                    }
+                }).asNodeStream();
+
+                const body: NodeJS.ReadableStream | undefined = response.body;
+                if (!body) {
+                    throw new Error('Azure AI Inference returned an empty response.');
+                }
+
+                if (String(response.status) !== '200') {
+                    const text = await readAll(body);
+                    let message = text;
+                    try {
+                        message = JSON.parse(text)?.error?.message ?? text;
+                    } catch {
+                        // not JSON; use the raw text
+                    }
+                    throw new Error(`Model request failed (${response.status}): ${String(message).slice(0, 500)}`);
+                }
+
+                for await (const data of readServerSentEvents(body)) {
+                    if (data === '[DONE]') return;
+                    let event: any;
+                    try {
+                        event = JSON.parse(data);
+                    } catch {
+                        continue; // ignore keep-alives and partial lines
+                    }
+                    if (event?.error) {
+                        throw new Error(event.error.message ?? 'Model stream failed.');
+                    }
+                    const text = event?.choices?.[0]?.delta?.content;
+                    if (text) yield text;
+                }
+            },
+            {
+                run_type: "llm",
+                name: "ChatAzureAIStream",
+                aggregator: (pieces: string[]) => pieces.join(''),
+                metadata: { ls_provider: "azure-ai-inference", ls_model_name: "azure_model", ls_model_type: "chat", ls_temperature: temperature, ls_instance: instanceId, ls_user: userId },
+            }
+        );
+
+        yield* streamChat({ messages: finalPrompt });
+    }
+}
+
+/** Reads a whole Node stream into a string (used for error bodies). */
+async function readAll(stream: NodeJS.ReadableStream): Promise<string> {
+    const decoder = new TextDecoder();
+    let text = '';
+    for await (const chunk of stream as AsyncIterable<Uint8Array | string>) {
+        text += typeof chunk === 'string' ? chunk : decoder.decode(chunk, { stream: true });
+    }
+    return text + decoder.decode();
+}
+
+/** Yields the `data:` payload of each server-sent event in an OpenAI-style streaming response. */
+async function* readServerSentEvents(stream: NodeJS.ReadableStream): AsyncGenerator<string, void, undefined> {
+    const decoder = new TextDecoder();
+    let buffer = '';
+    for await (const chunk of stream as AsyncIterable<Uint8Array | string>) {
+        buffer += typeof chunk === 'string' ? chunk : decoder.decode(chunk, { stream: true });
+        let newline: number;
+        while ((newline = buffer.indexOf('\n')) >= 0) {
+            const line = buffer.slice(0, newline).replace(/\r$/, '');
+            buffer = buffer.slice(newline + 1);
+            if (line.startsWith('data:')) yield line.slice(5).trim();
+        }
+    }
+    buffer += decoder.decode();
+    if (buffer.startsWith('data:')) yield buffer.slice(5).trim();
 }

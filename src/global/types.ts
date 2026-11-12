@@ -62,6 +62,15 @@ export type ConversationEntry = {
     chunks: string[];
 }
 
+/**
+ * Events yielded by `queryStream`: a `token` event for each piece of answer text as the model
+ * generates it, then a single `done` event carrying the saved conversation entry (the same shape
+ * that `query` returns).
+ */
+export type QueryStreamEvent =
+    | { type: 'token'; text: string }
+    | { type: 'done'; entry: ConversationEntry };
+
 export type Sources = {
     source: string;
     loaderId: string
