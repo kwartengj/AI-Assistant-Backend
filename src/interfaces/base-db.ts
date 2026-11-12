@@ -11,4 +11,9 @@ export interface BaseDb {
 
     getFullText(): Promise<string>; // to get the full text of the database
     getChunks(): Promise<ExtractChunkData[]>; // to get all the chunks in the database
+
+    /** Optional: vector search that can return stored vectors (see retrieval/) */
+    searchCandidates?(query: number[], k: number, options?: { withVectors?: boolean }): Promise<(ExtractChunkData & { vector?: number[] })[]>;
+    /** Optional: mean of unit chunk vectors, for whole-database similarity (see retrieval/) */
+    getProfile?(): Promise<{ count: number; meanUnit: number[] | null }>;
 }

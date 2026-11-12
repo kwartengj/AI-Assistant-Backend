@@ -148,6 +148,15 @@ export abstract class BaseModel {
         return result;
     }
 
+    /**
+     * One-off query with no conversation history and nothing saved (e.g. compressing retrieved
+     * passages). The context is passed in the prompt by the caller, not as supporting chunks.
+     */
+    public async standaloneQuery(system: string, userQuery: string): Promise<string> {
+        const result = await this.runQuery(system, userQuery, [], []);
+        return typeof result === 'string' ? result : String(result ?? '');
+    }
+
     private extractUniqueSources(supportingContext: Chunk[]): Sources[] {
         const uniqueSources = new Map<string, Sources>();  // Use a Map to track unique sources by URL
 

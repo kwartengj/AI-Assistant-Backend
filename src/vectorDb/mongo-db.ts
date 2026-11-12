@@ -159,6 +159,71 @@ export class MongoDb implements BaseDb {
         });
     }
 
+    /**
+     * Vector search that can also return each chunk's stored vector, for strategies that compare
+     * chunks with each other (MMR) or with topics, without embedding anything again.
+     */
+    async searchCandidates(query: number[], k: number, { withVectors = false }: { withVectors?: boolean } = {}) {
+        const rows = await this.collection
+            .aggregate([
+                {
+                    $vectorSearch: {
+                        index: this.getIndexName(MongoDb.VECTOR_FIELD_NAME),
+                        path: MongoDb.VECTOR_FIELD_NAME,
+                        numCandidates: Math.max(100, 15 * k),
+                        queryVector: query,
+                        limit: k,
+                    },
+                },
+                {
+                    $project: {
+                        _id: 0,
+                        source: 1,
+                        metadata: 1,
+                        pageContent: 1,
+                        [MongoDb.UNIQUE_FIELD_NAME]: 1,
+                        [MongoDb.LOADER_FIELD_NAME]: 1,
+                        ...(withVectors ? { [MongoDb.VECTOR_FIELD_NAME]: 1 } : {}),
+                        score: { $meta: 'vectorSearchScore' },
+                    },
+                },
+            ])
+            .toArray();
+        return rows.map((row) => ({
+            score: row.score,
+            pageContent: row.pageContent,
+            metadata: {
+                ...row.metadata,
+                source: row.source,
+                id: row[MongoDb.UNIQUE_FIELD_NAME],
+                uniqueLoaderId: row[MongoDb.LOADER_FIELD_NAME],
+            },
+            ...(withVectors && Array.isArray(row[MongoDb.VECTOR_FIELD_NAME]) ? { vector: row[MongoDb.VECTOR_FIELD_NAME] as number[] } : {}),
+        }));
+    }
+
+    /**
+     * The mean of every chunk's unit-length vector. Its dot product with a unit query vector is the
+     * average cosine similarity between the query and the whole database. Streams vectors only.
+     */
+    async getProfile(): Promise<{ count: number; meanUnit: number[] | null }> {
+        const cursor = this.collection.find({}, { projection: { _id: 0, [MongoDb.VECTOR_FIELD_NAME]: 1 } });
+        let sum: number[] | null = null;
+        let count = 0;
+        for await (const doc of cursor) {
+            const v = doc[MongoDb.VECTOR_FIELD_NAME] as number[];
+            if (!Array.isArray(v) || !v.length) continue;
+            let m = 0;
+            for (const x of v) m += x * x;
+            m = Math.sqrt(m) || 1;
+            if (!sum) sum = new Array(v.length).fill(0);
+            if (v.length !== sum.length) continue;
+            for (let i = 0; i < v.length; i++) sum[i] += v[i] / m;
+            count++;
+        }
+        return { count, meanUnit: sum && count ? sum.map((x) => x / count) : null };
+    }
+
     async getVectorCount(): Promise<number> {
         return this.collection.countDocuments();
     }
@@ -175,7 +240,7 @@ export class MongoDb implements BaseDb {
     
     async getFullText(): Promise<string> {
         try {
-            const chunks = await this.collection.find().toArray();
+            const chunks = await this.collection.find({}, { projection: { pageContent: 1 } }).toArray();
             const fullText = chunks.map(chunk => chunk.pageContent).join(' ');
             return fullText;
         } catch (error) {
@@ -186,7 +251,7 @@ export class MongoDb implements BaseDb {
 
     async getChunks(): Promise<ExtractChunkData[]> {
         try {
-            const chunks = await this.collection.find().toArray();
+            const chunks = await this.collection.find({}, { projection: { [MongoDb.VECTOR_FIELD_NAME]: 0 } }).toArray();
             return chunks.map(chunk => ({
                 score: 0, // default if not used in similarity search
                 pageContent: chunk.pageContent,

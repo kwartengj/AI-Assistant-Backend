@@ -3,728 +3,182 @@
  * created on: 27-02-2025-18h-35m
  * github: https://github.com/kwartengj
  * copyright 2025
+ *
+ * Several vector databases searched as one. The first database is the primary one: it receives
+ * every write (new chunks, deletions, resets). The others are read-only for this application.
+ *
+ * Selection strategies live in ../retrieval and run per request through RAGApplication.retrieve(),
+ * so concurrent requests can use different strategies. similaritySearch() keeps the original
+ * behaviour (top results from every database, merged) for code that doesn't use retrieve().
  */
 import createDebugMessages from 'debug';
+
 import { BaseDb } from '../interfaces/base-db.js';
 import { ExtractChunkData, InsertChunkData } from '../global/types.js';
-import { RAGEmbedding } from '../core/rag-embedding.js';
-import { RAGApplication } from '../core/rag-application.js';
+import { Candidate, DbCandidates, DbProfile } from '../retrieval/types.js';
 
+type NamedDb = { database: BaseDb; name: string };
 
 export class SetOfDbs implements BaseDb {
     private readonly debug = createDebugMessages('embedjs:vector:SetOfDbs');
-    private readonly DEFAULT_DB_POSITION = 0;
-    private currentStrategy: string;
-    private relevanceThreshold: number; // Threshold for selecting sources based on relevance score
-    private numberK: number; // Number of chunks to retrieve per source * this overrides the k in the similarity search
-    private dbs: {
-        database: BaseDb,
-        name: string
-    }[];
+    private static readonly PRIMARY = 0;
 
-    private ragApplication;
+    private readonly dbs: NamedDb[];
+    /** Profiles are cached until a database's chunk count changes */
+    private readonly profileCache = new Map<string, DbProfile>();
+    private readonly profileJobs = new Map<string, Promise<DbProfile>>();
 
-    constructor(dbs: {
-        database: BaseDb,
-        name: string
-    }[]) {
+    /** Defaults for RAGApplication.retrieve() when a request doesn't name them (kept for older callers) */
+    private defaultStrategy: string | undefined;
+    private relevanceThreshold: number | undefined;
+    private numberK: number | undefined;
+
+    constructor(dbs: NamedDb[]) {
         if (!dbs || dbs.length === 0) {
             throw new Error('At least one database must be provided.');
         }
         this.dbs = dbs;
     }
 
-    async init({ dimensions }: { dimensions: number }): Promise<void> {
-        this.debug('Connecting to set of database...');
-        await Promise.all(this.dbs.map(db => db.database.init({ dimensions })));
-        this.debug('Connected to set of database');
+    get names(): string[] {
+        return this.dbs.map((db) => db.name);
     }
+
+    async init({ dimensions }: { dimensions: number }) {
+        this.debug('Connecting to set of databases...');
+        await Promise.all(this.dbs.map((db) => db.database.init({ dimensions })));
+        this.debug('Connected to set of databases');
+    }
+
+    /* ---------- writes: primary database only ---------- */
 
     async insertChunks(chunks: InsertChunkData[]): Promise<number> {
-        return this.dbs[this.DEFAULT_DB_POSITION].database.insertChunks(chunks);
+        return this.dbs[SetOfDbs.PRIMARY].database.insertChunks(chunks);
     }
 
-    async similaritySearch(query: number[], k: number, rawQuery?: string): Promise<ExtractChunkData[]> {
-        // apply strategy for similarity search
-        if (this.numberK) {
-            k = this.numberK; // override the k
-        }
-        switch (this.currentStrategy) {
-            case 'topKNChunks':
-                return await this.similaritySearchTopKNChunksStrategy(query, k);
-            case 'topKChunksPerSource':
-                return await this.similaritySearchTopKChunksPerSourceStrategy(query, k);
-            case 'weightedRelevance':
-                return await this.similaritySearchWeightedRelevanceStrategy(query, k);
-            case 'topicClassification':
-                return await this.similaritySearchTopicClassificationStrategy(query, k, rawQuery);
-            case 'llmSummarization':
-                return await this.similaritySearchLLMSummarization(query, k, rawQuery);
-            default:
-                return await this.similaritySearchDefaultStrategy(query, k);    
-        }
+    async deleteKeys(uniqueLoaderId: string): Promise<boolean> {
+        return this.dbs[SetOfDbs.PRIMARY].database.deleteKeys(uniqueLoaderId);
     }
 
-    async similaritySearchDefaultStrategy(query: number[], k: number): Promise<ExtractChunkData[]> {
-        // Fetch results from all databases and attach dbName: Top k chunks across all sources (k chunks)
-        const allResults = await Promise.all(
-            this.dbs.map(async (db) => {
-                const dbResults = await db.database.similaritySearch(query, k);
-                return dbResults.map(chunk => ({
-                    ...chunk,
-                    metadata: { ...chunk.metadata, dbName: db.name } 
-                }));
-            })
-        );
-        return allResults.flat();
+    async reset(): Promise<void> {
+        await this.dbs[SetOfDbs.PRIMARY].database.reset();
     }
 
-    async similaritySearchTopKNChunksStrategy(query: number[], k: number): Promise<ExtractChunkData[]> {
-        // Top k/n chunks from each of n databases individually (k chunks): The top k chunks are selected from each of the n sources, with each database contributing equally.
-        const chunksPerDb = Math.ceil(k / this.dbs.length); // Calculate chunks per data source
-        const allResults = await Promise.all(
-            this.dbs.map(async (db) => {
-                const dbResults = await db.database.similaritySearch(query, chunksPerDb); // in this case we need to change k
-                return dbResults.map(chunk => ({
-                    ...chunk,
-                    metadata: { ...chunk.metadata, dbName: db.name } 
-                }));
-            })
-        );
-        return allResults.flat().slice(0, k); // Select top k chunks from all sources
+    /** Chunks in the primary database (the application's own sources) */
+    async getVectorCount(): Promise<number> {
+        return this.dbs[SetOfDbs.PRIMARY].database.getVectorCount();
     }
 
-    async similaritySearchTopKChunksPerSourceStrategy(query: number[], k: number): Promise<ExtractChunkData[]> {
-        // Top k chunks from each of n sources individually (n*k chunks)
-        const allResults = await Promise.all(
-            this.dbs.map(async (db) => {
-                const dbResults = await db.database.similaritySearch(query, k);  // in this case we need to change k
-                // Ensure we select **exactly k** per database
-                const topKChunks = dbResults.slice(0, k).map(chunk => ({
-                    ...chunk,
-                    metadata: { ...chunk.metadata, dbName: db.name }
-                }));
-                return topKChunks;
-            })
-        );
-        return allResults.flat();
-    }
+    /* ---------- reads ---------- */
 
-    async similaritySearchWeightedRelevanceStrategy(query: number[], k: number): Promise<ExtractChunkData[]> {
-        try {
-            // Step 1: Generate full-text embeddings for each source
-            const embeddings = await Promise.all(
-                this.dbs.map(async db => {
-                    const fullText = await db.database.getFullText(); 
-                    return { db, embedding: await RAGEmbedding.getEmbedding().embedQuery(fullText) };
-                })
-            );
-    
-            // Step 2: Calculate cosine similarity between the query and each source's full-text embedding
-            const similarities = embeddings.map(({ db, embedding }) => ({
-                db,
-                similarity: this.euclideanDistance(this.normalize(query), this.normalize(embedding))
-            }));
-    
-            // Step 3: Normalize similarities to weights between [0, 1]
-            const totalSimilarity = similarities.reduce((sum, { similarity }) => sum + similarity, 0);
-            const weights = similarities.map(({ db, similarity }) => ({
-                db,
-                weight: similarity / totalSimilarity
-            }));
-
-            // Step 4: Retrieve chunks from the top k sources
-            const results = await this.retrieveChunks(weights, query, k);
-            return results;
-    
-        } catch (error) {
-            this.debug('Error during weighted relevance strategy similarity search:', error);
-            throw error;
-        }
-    }
-    
-
-    // async similaritySearchTopicClassificationStrategy(query: number[], k: number, rawQuery: string): Promise<ExtractChunkData[]> {
-    //     try {
-    //         // Step 1: Extract topics and entities from the user's query
-    //         const queryTopicsAndEntities = await this.extractTopicsAndEntities(rawQuery);
-
-    //         // Step 2: Extract topics and entities from the sources
-    //         const sourceTopicEntities = await Promise.all(
-    //             this.dbs.map(async db => {
-    //                 const fullText = await db.database.getFullText();
-    //                 // Step 1: Split full text into smaller chunks (~512-1024 tokens each)
-    //                 const textChunks = this.chunkText(fullText, 512); // might reduce to 256
-
-    //                 // Step 2: Extract topics/entities for each chunk separately
-    //                 const chunkResults = await Promise.all(
-    //                     textChunks.map(async chunk => await this.extractTopicsAndEntities(chunk))
-    //                 );
-
-    //                 // Step 3: Aggregate extracted topics/entities across all chunks
-    //                 const topicsMap = new Map<string, number>();
-    //                 const entitiesMap = new Map<string, number>();
-
-    //                 chunkResults.forEach(({ topics, entities }) => {
-    //                     for (const [topic, weight] of Object.entries(topics)) {
-    //                         if (topicsMap.has(topic)) {
-    //                             topicsMap.set(topic, topicsMap.get(topic)! + weight); // Accumulate weights
-    //                         } else {
-    //                             topicsMap.set(topic, weight);
-    //                         }
-    //                     }
-    //                     for (const [entity, weight] of Object.entries(entities)) {
-    //                         if (entitiesMap.has(entity)) {
-    //                             entitiesMap.set(entity, entitiesMap.get(entity)! + weight); // Accumulate weights
-    //                         } else {
-    //                             entitiesMap.set(entity, weight);
-    //                         }
-    //                     }
-    //                 });
-
-    //                 return { 
-    //                     db, 
-    //                     topics: Object.fromEntries(topicsMap), // Convert Map to object
-    //                     entities: Object.fromEntries(entitiesMap) // Convert Map to object
-    //                 };
-    //             })
-    //         );
-
-    //         // Step 3: Calculate relevance scores
-    //         const scoredSources = sourceTopicEntities.map(({ db, topics, entities }) => {
-    //             const relevanceScore = this.computeRelevanceScore(topics, entities, queryTopicsAndEntities);
-    //             return { db, relevanceScore };
-    //         });
-
-    //         // Step 4: Retrieve chunks from the top k sources
-    //         const results = await this.retrieveChunks(scoredSources, query, k);
-    //         return results;
-    //     } catch (error) {
-    //         this.debug('Error during topic classification strategy similarity search:', error);
-    //         throw error;
-    //     }
-    // }
-
-
-    // async similaritySearchTopicClassificationStrategy(query: number[], k: number, rawQuery: string): Promise<ExtractChunkData[]> {
-    //     try {
-    //         // Step 1: Extract topics and entities from the user's query
-    //         const queryTopicsAndEntities = await this.extractTopicsAndEntities(rawQuery);
-    
-    //         // Step 2: Extract topics and entities from the sources
-    //         const sourceTopicEntities = await Promise.all(
-    //             this.dbs.map(async db => {
-    //                 // Get the chunks from the database
-    //                 const chunks = await db.database.getChunks();
-    
-    //                 // Process chunks in parallel with a concurrency limit
-    //                 const chunkResults = await this.processChunksWithConcurrency(chunks, async chunk => {
-    //                     // Check if topics and entities are already cached in the chunk metadata
-    //                     if (chunk.metadata.topics && chunk.metadata.entities) {
-    //                         return {
-    //                             topics: typeof chunk.metadata.topics === 'string' ? JSON.parse(chunk.metadata.topics) : {},
-    //                             entities: typeof chunk.metadata.entities === 'string' ? JSON.parse(chunk.metadata.entities) : {}
-    //                         };
-    //                     }
-    
-    //                     // Extract topics and entities from the chunk
-    //                     const { topics, entities } = await this.extractTopicsAndEntities(chunk.pageContent);
-    
-    //                     // Cache the topics and entities in the chunk metadata for future use
-    //                     chunk.metadata.topics = JSON.stringify(topics);
-    //                     chunk.metadata.entities = JSON.stringify(entities);
-    
-    //                     // Update the chunk metadata in the database (optional, can be done asynchronously)
-    //                     // await db.database.updateChunkMetadata(chunk.id, chunk.metadata);
-    
-    //                     return { topics, entities };
-    //                 });
-    
-    //                 // Step 3: Aggregate extracted topics/entities across all chunks
-    //                 const topicsMap = new Map<string, number>();
-    //                 const entitiesMap = new Map<string, number>();
-    
-    //                 chunkResults.forEach(({ topics, entities }) => {
-    //                     for (const [topic, weight] of Object.entries(topics)) {
-    //                         topicsMap.set(topic, (topicsMap.get(topic) || 0) + (weight as number));
-    //                     }
-    //                     for (const [entity, weight] of Object.entries(entities)) {
-    //                         entitiesMap.set(entity, (entitiesMap.get(entity) || 0) + (weight as number));
-    //                     }
-    //                 });
-    
-    //                 return {
-    //                     db,
-    //                     topics: Object.fromEntries(topicsMap), // Convert Map to object
-    //                     entities: Object.fromEntries(entitiesMap) // Convert Map to object
-    //                 };
-    //             })
-    //         );
-    
-    //         // Step 3: Calculate relevance scores
-    //         const scoredSources = sourceTopicEntities.map(({ db, topics, entities }) => {
-    //             const relevanceScore = this.computeRelevanceScore(topics, entities, queryTopicsAndEntities);
-    //             return { db, relevanceScore };
-    //         });
-    
-    //         // Step 4: Retrieve chunks from the top k sources
-    //         const results = await this.retrieveChunks(scoredSources, query, k);
-    //         return results;
-    //     } catch (error) {
-    //         this.debug('Error during topic classification strategy similarity search:', error);
-    //         throw error;
-    //     }
-    // }
-
-    // Topic classification strategy
-    async similaritySearchTopicClassificationStrategy(query: number[], k: number, rawQuery: string): Promise<ExtractChunkData[]> {
-        try {
-            // Step 1: Extract topics and entities from the user's query
-            const queryTopicsAndEntities = await this.extractTopicsAndEntities(rawQuery);
-
-            // Step 2: Process chunks in parallel with optimized batching
-            const sourceTopicEntities = await Promise.all(
-                this.dbs.map(async db => {
-                    const chunks = await db.database.getChunks();
-                    const topicsMap = new Map<string, number>();
-                    const entitiesMap = new Map<string, number>();
-
-                    // Process chunks in parallel with a concurrency limit
-                    const batchSize = 100; // Adjust based on system limits
-                    const processBatch = async (batch: ExtractChunkData[]) => {
-                        const batchResults = await Promise.all(
-                            batch.map(async chunk => {
-                                // Use cached metadata if available
-                                if (chunk.metadata?.topics && chunk.metadata?.entities) {
-                                    return {
-                                        topics: JSON.parse(chunk.metadata.topics as string),
-                                        entities: JSON.parse(chunk.metadata.entities as string)
-                                    };
-                                }
-
-                                // Extract topics and entities if not cached
-                                const result = await this.extractTopicsAndEntities(chunk.pageContent);
-
-                                // Cache the result in the chunk metadata
-                                chunk.metadata = {
-                                    ...chunk.metadata,
-                                    topics: JSON.stringify(result.topics),
-                                    entities: JSON.stringify(result.entities)
-                                };
-                                return result;
-                            })
-                        );
-
-                        // Aggregate results for the current batch
-                        batchResults.forEach(({ topics, entities }) => {
-                            for (const [topic, weight] of Object.entries(topics)) {
-                                topicsMap.set(topic, (topicsMap.get(topic) || 0) + (weight as number));
-                            }
-                            for (const [entity, weight] of Object.entries(entities)) {
-                                entitiesMap.set(entity, (entitiesMap.get(entity) || 0) + (weight as number));
-                            }
-                        });
-                    };
-
-                    // Process chunks in batches
-                    for (let i = 0; i < chunks.length; i += batchSize) {
-                        await processBatch(chunks.slice(i, i + batchSize));
-                    }
-
-                    return {
-                        db,
-                        topics: Object.fromEntries(topicsMap), // Convert Map to object
-                        entities: Object.fromEntries(entitiesMap) // Convert Map to object
-                    };
-                })
-            );
-
-            // Step 3: Calculate relevance scores
-            const scoredSources = sourceTopicEntities.map(({ db, topics, entities }) => {
-                const relevanceScore = this.computeRelevanceScore(topics, entities, queryTopicsAndEntities);
-                return { db, relevanceScore };
-            });
-
-            // Step 4: Retrieve chunks from the top k sources
-            const results = await this.retrieveChunks(scoredSources, query, k);
-            return results;
-        } catch (error) {
-            this.debug('Error during topic classification strategy similarity search:', error);
-            throw error;
-        }
-    }
-
-    // async similaritySearchLLMSummarization(query: number[], k: number, rawQuery: string): Promise<ExtractChunkData[]> {
-    //     // Step 1: Generate full-text embeddings for each source
-    //     const summarisedSources = await Promise.all(
-    //         this.dbs.map(async db => {
-    //             const fullText = await db.database.getFullText();
-    //             const summarizedText = await this.summarizeText(fullText, rawQuery, true);
-    //             const embeddingRelevance = await RAGEmbedding.getEmbedding().embedQuery(summarizedText);
-    //             return { db, embeddingRelevance };
-    //         })
-    //     );
-
-    //     // Step 2: Calculate euclidean similarity between the query and each source's full-text embedding
-    //     const similarities = summarisedSources.map(({ db, embeddingRelevance }) => ({
-    //         db,
-    //         similarity: this.euclideanDistance(this.normalize(query), this.normalize(embeddingRelevance))
-    //     }));
-
-    //     // Step 3: Check the similarity score and select the top k sources
-    //     const selectedSource = similarities.reduce((highest, current) => {
-    //         return current.similarity > highest.similarity ? current : highest;
-    //     }, similarities[0]);
-
-    //     // Step 4: Retrieve chunks from the db with the highest similarity score
-    //     const results = await selectedSource.db.database.similaritySearch(query, k);
-    //     return results.map(chunk => ({
-    //         ...chunk,
-    //         metadata: { ...chunk.metadata, dbName: selectedSource.db.name }
-    //     }));
-    // }
-
-    //summarize full text with relevance to the query and in general
-    
-    async similaritySearchLLMSummarization(query: number[], k: number, rawQuery: string): Promise<ExtractChunkData[]> {
-        try {
-            // Step 1: Process each database in parallel with optimized chunk processing
-            const normalizedQuery = this.normalize(query);
-            const batchSize = 100; // Optimal batch size for parallel processing
-            
-            // Process all databases in parallel
-            const sourcePromises = this.dbs.map(async (db) => {
-                // Get all chunks at once
-                const chunks = await db.database.getChunks();
-                if (!chunks.length) return { db, similarity: -Infinity };
-    
-                // Process chunks in batches for summarization
-                const chunkSummaries: string[] = [];
-                for (let i = 0; i < chunks.length; i += batchSize) {
-                    const batch = chunks.slice(i, i + batchSize);
-                    
-                    // Summarize batch in parallel with error handling
-                    const batchSummaries = await Promise.all(
-                        batch.map(chunk => 
-                            this.summarizeText(chunk.pageContent, rawQuery, false)
-                                .catch(() => '') // Silently handle errors
-                        )
-                    );
-                    
-                    // Filter and add non-empty summaries
-                    for (const summary of batchSummaries) {
-                        if (summary && summary.trim()) chunkSummaries.push(summary);
-                    }
-                }
-    
-                if (!chunkSummaries.length) return { db, similarity: -Infinity };
-    
-                // Combine summaries and generate embedding
-                const combinedSummary = chunkSummaries.join('\n\n');
-                const embeddingRelevance = await RAGEmbedding.getEmbedding()
-                    .embedQuery(combinedSummary)
-                    .catch(() => []); // Fallback to empty array
-    
-                if (!embeddingRelevance.length) return { db, similarity: -Infinity };
-    
-                return {
-                    db,
-                    similarity: Math.max(0, Math.min(1, 1 - (this.euclideanDistance(normalizedQuery, this.normalize(embeddingRelevance))))) // Normalize to [0, 1]
-                };
-            });
-    
-            // Wait for all sources to be processed
-            const sourcesWithSimilarities = await Promise.all(sourcePromises);
-    
-            // Find the best source (filter out invalid ones first)
-            const validSources = sourcesWithSimilarities.filter(s => s.similarity !== -Infinity);
-            if (!validSources.length) return [];
-    
-            const bestSource = validSources.reduce((best, current) => 
-                current.similarity > best.similarity ? current : best
-            );
-    
-            // Retrieve results from the best source
-            const results = await bestSource.db.database.similaritySearch(query, k);
-            return results.map(chunk => ({
+    /** Original behaviour: the top k from every database, merged (the caller sorts and trims). */
+    async similaritySearch(query: number[], k: number): Promise<ExtractChunkData[]> {
+        const perDb = await this.searchAllDbs(query, this.numberK || k);
+        return perDb.flatMap((d) =>
+            d.candidates.map(({ vector: _v, dbName, dbRank: _r, ...chunk }) => ({
                 ...chunk,
-                metadata: { ...chunk.metadata, dbName: bestSource.db.name }
-            }));
-        } catch (error) {
-            this.debug('Error during LLM summarization similarity search:', error);
-            throw error;
-        }
-    }
-    
-    private async summarizeText(text: string, query: string, isRelevant: boolean): Promise<string> {
-        // Cache prompt templates to avoid recreation
-        const promptTemplates = {
-            relevant: `Summarize the content below, paying attention to what is relevant to the query: "${query}".  
-                - Ensure the summary is **concise yet sufficiently detailed** to capture key points.  
-                - The summary should be **clear, accurate, and contextually relevant**.  
-                - Avoid opinions, interpretations, or extra information not in the original text.  
-                Text to summarize: ${text}  
-                Respond with **only** the summary, without extra text or formatting.`,
-            
-            general: `Summarize the following text clearly and concisely.  
-                - Capture **main ideas, key points, and essential details**.  
-                - The summary should be **neutral, structured, and coherent**.  
-                - **Exclude** personal opinions or any extraneous information.  
-                Text to summarize:${text}
-                Respond with **only** the summary, without extra text or formatting.`
-        };
-    
-        try {
-            const prompt = isRelevant ? promptTemplates.relevant : promptTemplates.general;
-            return await this.ragApplication.silentConversationQuery(prompt, null, 'default', []);
-        } catch (error) {
-            this.debug('Error during text summarization:', error);
-            return ''; // Return empty string instead of throwing to keep processing going
-        }
+                metadata: { ...chunk.metadata, dbName },
+            })),
+        );
     }
 
-    //summarize full text with relevance to the query and in general
-    // private async summarizeText(fullText: string, rawQuery: string): Promise<{relevanceSummary: string, generalSummary: string}> {
-    //     if (!this.ragApplication) {
-    //         throw new Error('RAGApplication instance is not initialized.');
-    //     }
-    //     // Step 1a: Summarize with relevance to the query
-    //     const promptRelevance = `Summarize the content below, paying attention to what is relevant to the query: "${rawQuery}".  
-    //             - Ensure the summary is **concise yet sufficiently detailed** to capture key points.  
-    //             - The summary should be **clear, accurate, and contextually relevant**.  
-    //             - Avoid opinions, interpretations, or extra information not in the original text.  
-    //             Text to summarize: ${fullText}  
-    //             Respond with **only** the summary, without extra text or formatting.`;
-    //     const responseRelevance = await this.ragApplication.silentConversationQuery(promptRelevance, null, 'default', []);
-
-    //     // Step 2b: Summarize in general (without query focus)
-    //     const generalSummaryPrompt = `Summarize the following text clearly and concisely.  
-    //     - Capture **main ideas, key points, and essential details**.  
-    //     - The summary should be **neutral, structured, and coherent**.  
-    //     - **Exclude** personal opinions or any extraneous information.  
-    //     Text to summarize: ${fullText}  
-    //     Respond with **only** the summary, without extra text or formatting.`;
-    //     const responseGeneral = await this.ragApplication.silentConversationQuery(generalSummaryPrompt, null, 'default', []);
-
-    //     return { relevanceSummary: responseRelevance, generalSummary: responseGeneral };
-    // }
-
-    private async extractTopicsAndEntities(text: string): Promise<{ topics: Record<string, number>, entities: Record<string, number> }> {
-        if (!this.ragApplication) {
-            throw new Error('RAGApplication instance is not initialized.');
-        }
-    
-        const prompt = `Analyze the text below and extract **3 to 7 distinct primary topics and entities**.  
-        Assign a weight (0 to 1) to each based on importance.  
-        Respond **strictly** in this JSON format:  
-        {  
-            "topics": { "topic1": weight, "topic2": weight, ..., "topicN": weight },  
-            "entities": { "entity1": weight, "entity2": weight, ..., "entityN": weight }  
-        }  
-        
-        **Rules**:  
-        1. Extract **3 to 7 topics** and **3 to 7 entities**.  
-        2. Weights must reflect importance (higher = more important).  
-        3. Ensure all topics and entities are **distinct and relevant**.  
-        4. Do **not** include explanations or extra text.  
-
-        Text: "${text}"`;
-    
-        let response: string, topics: Record<string, number>, entities: Record<string, number>;
-        response = await this.ragApplication.silentConversationQuery(prompt, null, 'default', []);
-        let parsedResponse: { topics: Record<string, number>, entities: Record<string, number> } = { topics: {}, entities: {} };
-
-        try {
-            parsedResponse = JSON.parse(response);
-            topics = parsedResponse.topics;
-            entities = parsedResponse.entities;
-            if (!topics || !entities) {
-                throw new Error(`Invalid JSON structure for topics/entities.`);
-            }
-            return { topics, entities };
-        } catch (error) {
-            try {
-                parsedResponse = JSON.parse(response + "}"); // This is a hack to get the error message from the response
-                topics = parsedResponse.topics;
-                entities = parsedResponse.entities;
-                if (!topics || !entities) {
-                    throw new Error(`Failed to fix the JSON Parser error`);
+    /**
+     * Searches every database in parallel. A database that fails is reported in `error` instead of
+     * failing the whole search.
+     */
+    async searchAllDbs(query: number[], perDb: number, { withVectors = false } = {}): Promise<DbCandidates[]> {
+        return Promise.all(
+            this.dbs.map(async (db): Promise<DbCandidates> => {
+                const started = Date.now();
+                try {
+                    const rows: (ExtractChunkData & { vector?: number[] })[] = db.database.searchCandidates
+                        ? await db.database.searchCandidates(query, perDb, { withVectors })
+                        : await db.database.similaritySearch(query, perDb);
+                    const candidates: Candidate[] = rows
+                        .sort((a, b) => b.score - a.score)
+                        .map((row, i) => ({
+                            ...row,
+                            metadata: { ...row.metadata, dbName: db.name },
+                            dbName: db.name,
+                            dbRank: i + 1,
+                        }));
+                    return { dbName: db.name, candidates, ms: Date.now() - started };
+                } catch (error) {
+                    this.debug(`Search failed for database ${db.name}:`, error);
+                    return { dbName: db.name, candidates: [], ms: Date.now() - started, error: (error as Error).message };
                 }
-                return {topics: topics, entities: entities }; // Fallback
-            } catch (error) {
-                console.error("Failed to extract topics and entities:", error, "Response:", response);
-                return {topics: {}, entities: {} }; // Fallback
-            }
-        } 
+            }),
+        );
     }
 
-    private computeRelevanceScore(sourceTopics: Record<string, number>, sourceEntities: Record<string, number>, queryTopicsAndEntities: { topics: Record<string, number>, entities: Record<string, number> }): number {
-        // function to compute relevance for a given set of items
-        const computeRelevance = (
-            sourceItems: Record<string, number>,
-            queryItems: Record<string, number>
-        ): { score: number, totalWeight: number } => {
-            let score = 0;
-            let totalWeight = 0;
-
-            for (const [item, weight] of Object.entries(sourceItems)) {
-                if (queryItems[item]) {
-                    const queryWeight = queryItems[item];
-                    score += weight * queryWeight; // Use float weights
-                    totalWeight += queryWeight;
+    /** Whole-database profiles (see DbProfile), computed once and refreshed when a database changes. */
+    async getProfiles(): Promise<Map<string, DbProfile>> {
+        const out = new Map<string, DbProfile>();
+        await Promise.all(
+            this.dbs.map(async (db) => {
+                if (!db.database.getProfile) return;
+                try {
+                    const count = await db.database.getVectorCount();
+                    const cached = this.profileCache.get(db.name);
+                    if (cached && cached.count === count) {
+                        out.set(db.name, cached);
+                        return;
+                    }
+                    let job = this.profileJobs.get(db.name);
+                    if (!job) {
+                        job = db.database
+                            .getProfile()
+                            .then((p) => ({ dbName: db.name, ...p }))
+                            .finally(() => this.profileJobs.delete(db.name));
+                        this.profileJobs.set(db.name, job);
+                    }
+                    const profile = await job;
+                    this.profileCache.set(db.name, profile);
+                    out.set(db.name, profile);
+                } catch (error) {
+                    this.debug(`Profile failed for database ${db.name}:`, error);
                 }
-            }
-
-            return { score, totalWeight };
-        };
-
-        // Compute relevance for topics and entities
-        const topicRelevance = computeRelevance(sourceTopics, queryTopicsAndEntities.topics);
-        const entityRelevance = computeRelevance(sourceEntities, queryTopicsAndEntities.entities);
-
-        // Combine scores and weights
-        const totalScore = topicRelevance.score + entityRelevance.score;
-        const totalWeight = topicRelevance.totalWeight + entityRelevance.totalWeight;
-
-        // Normalize score and ensure it's between 0 and 1
-        return totalWeight > 0 ? Math.min(1, totalScore / totalWeight) : 0;
-    }
-    
-    private async retrieveChunks(scoredSources: { db: { database: BaseDb, name: string }, relevanceScore?: number, weight?: number }[], query: number[], k: number): Promise<ExtractChunkData[]> {
-        let chunksPerSource: { db: { database: BaseDb, name: string }, relevanceScore?:number, numChunks?: number }[] = [];
-
-        // Check if relevanceScore or weight is provided for the sources and calculate the number of chunks to select
-        if ('relevanceScore' in scoredSources[0]) {
-            chunksPerSource = scoredSources.map(({ db, relevanceScore }) => ({
-                db,
-                relevanceScore,
-            }));
-        } else if ('weight' in scoredSources[0]) {
-            chunksPerSource = scoredSources.map(({ db, weight }) => ({
-                db,
-                relevanceScore: weight,
-                numChunks: Math.round(k * weight)
-            }));
-
-             // Adjust chunk counts to ensure the total is exactly k
-            let totalChunks = chunksPerSource.reduce((sum, { numChunks }) => sum + numChunks, 0);
-            while (totalChunks !== k) {
-                const diff = k - totalChunks;
-                const adjustment = diff > 0 ? 1 : -1;
-                const index = chunksPerSource.findIndex(({ numChunks }) => numChunks + adjustment >= 0);
-                if (index !== -1) {
-                    chunksPerSource[index].numChunks += adjustment;
-                    totalChunks += adjustment;
-                }
-            }
-        } else {
-            throw new Error('Neither relevanceScore nor weight is provided for the sources.');
-        }
-    
-        // Retrieve chunks from each source
-        const results = await Promise.all(chunksPerSource.map(async ({ db, relevanceScore, numChunks }) => {
-            if (numChunks > 0) { // weightedRelevance
-                const dbResults = await db.database.similaritySearch(query, numChunks);
-                return dbResults.map(chunk => ({
-                    ...chunk,
-                    metadata: { ...chunk.metadata, dbName: db.name },
-                    weightedRelevance: relevanceScore
-                }));
-            } else if (relevanceScore >= this.relevanceThreshold) { // topicClassification
-                const dbResults = await db.database.similaritySearch(query, k);
-                return dbResults.map(chunk => ({
-                    ...chunk,
-                    metadata: { ...chunk.metadata, dbName: db.name },
-                    topicRelevance: relevanceScore
-                }));
-            }
-            return [];
-        }));
-    
-        return results.flat();
+            }),
+        );
+        return out;
     }
 
-    // switch to the ecludian distance for the similarity search **
-    private cosineSimilarity(vecA: number[], vecB: number[]): number {
-        const dotProduct = vecA.reduce((sum, a, i) => sum + a * vecB[i], 0);
-        const magnitudeA = Math.sqrt(vecA.reduce((sum, a) => sum + a * a, 0));
-        const magnitudeB = Math.sqrt(vecB.reduce((sum, b) => sum + b * b, 0));
-        return dotProduct / (magnitudeA * magnitudeB);
+    async getFullText(): Promise<string> {
+        const allTexts = await Promise.all(this.dbs.map((db) => db.database.getFullText()));
+        return allTexts.join(' ');
     }
 
-    // normalize a vector
-    private normalize(vec: number[]): number[] {
-        const magnitude = Math.sqrt(vec.reduce((sum, val) => sum + val ** 2, 0));
-        return vec.map(val => val / magnitude);
+    async getChunks(): Promise<ExtractChunkData[]> {
+        const allChunks = await Promise.all(this.dbs.map((db) => db.database.getChunks()));
+        return allChunks.flat();
     }
 
-    // calculate Euclidean distance
-    private euclideanDistance(vecA: number[], vecB: number[]): number{
-        const cosSim = this.cosineSimilarity(vecA, vecB);  // Calculate cosine similarity
-        return Math.sqrt(2 * (1 - cosSim));
-    }
+    /* ---------- defaults (older API) ---------- */
 
-    // set the strategy for the similarity search
     setStrategy(strategy: string): void {
-        this.currentStrategy = strategy;
+        this.defaultStrategy = strategy;
     }
 
-    // set relevancethreshold
+    getStrategy(): string | undefined {
+        return this.defaultStrategy;
+    }
+
     setRelevanceThreshold(relevanceThreshold: number): void {
         this.relevanceThreshold = relevanceThreshold;
     }
 
-    // set number of chunks to retrieve per source
+    getRelevanceThreshold(): number | undefined {
+        return this.relevanceThreshold;
+    }
+
     setNumberK(numberK: number): void {
         this.numberK = numberK;
     }
 
-    // set the ragApp initialised in the main app
-    ragApp(ragApp: RAGApplication): void {
-        this.ragApplication = ragApp;
+    getNumberK(): number | undefined {
+        return this.numberK;
     }
 
-    async getVectorCount(): Promise<number> {
-        const counts = await Promise.all(this.dbs.map(db => db.database.getVectorCount()));
-        return counts.reduce((sum, count) => sum + count, 0);
-    }
-
-    async deleteKeys(uniqueLoaderId: string): Promise<boolean> {
-        const results = await Promise.all(this.dbs.map(db => db.database.deleteKeys(uniqueLoaderId)));
-        return results.every(result => result);
-    }
-
-    async reset(): Promise<void> {
-        await Promise.all(this.dbs.map(db => db.database.reset()));
-    }
-    
-    // Fetch and concatenate all stored chunks as full text
-    async getFullText(): Promise<string> {
-        try {
-            const allTexts = await Promise.all(this.dbs.map(db => db.database.getFullText()));
-            return allTexts.join(' ');
-        } catch (error) {
-            this.debug('Error fetching full text:', error);
-            throw error;
-        }
-    }
-
-    async getChunks(): Promise<ExtractChunkData[]> {
-        // Returning getting all chunks from all sources
-        const allChunks = await Promise.all(
-            this.dbs.map(async db => db.database.getChunks())
-        );
-        return allChunks.flat();
-    }
-
-    // chunk the fulltext into smaller chunks
-    chunkText(text: string, maxTokens: number): string[] {
-        const words = text.split(/\s+/); // Split by spaces (or use a tokenizer for better control)
-        const chunks = [];
-
-        for (let i = 0; i < words.length; i += maxTokens) {
-            chunks.push(words.slice(i, i + maxTokens).join(' '));
-        }
-        return chunks;
-    }
+    /** No longer needed (strategies don't call the model); kept so existing callers still work. */
+    ragApp(_ragApp: unknown): void {}
 }

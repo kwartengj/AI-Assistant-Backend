@@ -40,9 +40,13 @@ import { VertexAI } from './models/vertexai-model.js';
 import { Ollama } from './models/ollama-model.js';
 import { MongoDb } from './vectorDb/mongo-db.js';
 import { SetOfDbs } from './vectorDb/set-of-db.js';
+import { STRATEGIES, resolveStrategy } from './retrieval/types.js';
+export type { RetrievalOptions, RetrievalResult, RetrievalTrace, StrategyId } from './retrieval/types.js';
 
 
 export {
+    STRATEGIES,
+    resolveStrategy,
     RAGApplication,
     RAGApplicationBuilder,
     TextLoader,
