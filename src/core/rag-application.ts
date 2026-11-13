@@ -15,6 +15,9 @@ import { OpenAi3SmallEmbeddings } from '../index.js';
 import { InMemoryConversations } from '../conversations/memory-conversations.js';
 import { getUnique } from '../util/arrays.js';
 
+/** Filled in by getContext/getEmbeddings when passed: time spent embedding the query and searching. */
+export type RetrievalTimings = { embedMs?: number; searchMs?: number };
+
 export class RAGApplication {
     private readonly debug = createDebugMessages('embedjs:core');
     private readonly queryTemplate: string;
@@ -319,9 +322,13 @@ export class RAGApplication {
      * based on a relevance cutoff value, sorted in descending order of score, and then sliced to return
      * only the number of results specified by the `searchResultCount` property.
      */
-    public async getEmbeddings(cleanQuery: string) {
+    public async getEmbeddings(cleanQuery: string, timings?: RetrievalTimings) {
+        let started = Date.now();
         const queryEmbedded = await RAGEmbedding.getEmbedding().embedQuery(cleanQuery);
+        if (timings) timings.embedMs = Date.now() - started;
+        started = Date.now();
         const unfilteredResultSet = await this.vectorDb.similaritySearch(queryEmbedded, this.searchResultCount + 10);
+        if (timings) timings.searchMs = Date.now() - started;
         this.debug(`Query resulted in ${unfilteredResultSet.length} chunks before filteration...`);
         return unfilteredResultSet
             .filter((result) => result.score > this.embeddingRelevanceCutOff)
@@ -335,9 +342,9 @@ export class RAGApplication {
      * needs to be processed.
      * @returns An array of unique page content items / chunks.
      */
-    public async getContext(query: string) {
+    public async getContext(query: string, timings?: RetrievalTimings) {
         const cleanQuery = cleanString(query);
-        const rawContext = await this.getEmbeddings(cleanQuery);
+        const rawContext = await this.getEmbeddings(cleanQuery, timings);
 
         return [...new Map(rawContext.map((item) => [item.pageContent, item])).values()];
     }

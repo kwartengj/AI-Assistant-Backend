@@ -1,6 +1,7 @@
 import { MongoClient } from 'mongodb';
 import { Conversation, ConversationEntry } from '../global/types.js';
 import { BaseConversations } from '../interfaces/base-conversations.js';
+import { acquireMongoClient, releaseMongoClient } from '../global/mongo-clients.js';
 
 interface ConversationDocument {
     _id?: string; // optional MongoDB ID field
@@ -12,7 +13,7 @@ export class MongoConversations implements BaseConversations {
     private readonly uri: string;
     private readonly dbName: string;
     private readonly collectionName: string;
-    private client: MongoClient;
+    private client: MongoClient | null = null;
 
     constructor({ uri, dbName, collectionName }: { uri: string, dbName: string, collectionName: string }) {
         this.uri = uri;
@@ -21,8 +22,7 @@ export class MongoConversations implements BaseConversations {
     }
 
     async init(): Promise<void> {
-        this.client = new MongoClient(this.uri);
-        await this.client.connect();
+        if (!this.client) this.client = await acquireMongoClient(this.uri);
         const collection = this.client.db(this.dbName).collection<ConversationDocument>(this.collectionName);
         await collection.createIndex({ conversationId: 1 });
         await collection.createIndex({ "entries._id": 1 });
@@ -70,12 +70,20 @@ export class MongoConversations implements BaseConversations {
         );
     }
 
+    /** Appends several entries in one write (e.g. a question and its answer). */
+    async addEntriesToConversation(conversationId: string, entries: ConversationEntry[]): Promise<void> {
+        const collection = this.client.db(this.dbName).collection<ConversationDocument>(this.collectionName);
+        await collection.updateOne({ conversationId }, { $push: { entries: { $each: entries } } });
+    }
+
     async clearConversations(): Promise<void> {
         const collection = this.client.db(this.dbName).collection(this.collectionName);
         await collection.deleteMany({});
     }
 
     async close(): Promise<void> {
-        await this.client.close();
+        if (!this.client) return;
+        this.client = null;
+        await releaseMongoClient(this.uri);
     }
 }

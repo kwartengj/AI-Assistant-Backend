@@ -3,6 +3,7 @@ import createDebugMessages from 'debug';
 
 import { BaseDb } from '../interfaces/base-db.js';
 import { ExtractChunkData, InsertChunkData } from '../global/types.js';
+import { acquireMongoClient, releaseMongoClient } from '../global/mongo-clients.js';
 
 export class MongoDb implements BaseDb {
     private readonly debug = createDebugMessages('embedjs:vector:MongoDb');
@@ -14,7 +15,8 @@ export class MongoDb implements BaseDb {
     private static readonly UNIQUE_FIELD_NAME = 'u_fld';
     private static readonly INDEX_PREFIX = 'index_';
 
-    private readonly client: MongoClient;
+    private readonly connectionString: string;
+    private client: MongoClient | null = null;
     private readonly dbName: string;
 
     private collection: Collection;
@@ -31,7 +33,7 @@ export class MongoDb implements BaseDb {
     }) {
         this.collectionName = collectionName ?? MongoDb.COLLECTION_NAME;
         this.dbName = dbName ?? MongoDb.DEFAULT_DB_NAME;
-        this.client = new MongoClient(connectionString);
+        this.connectionString = connectionString;
     }
 
     private getIndexName(indexName: string) {
@@ -40,7 +42,8 @@ export class MongoDb implements BaseDb {
 
     async init({ dimensions }: { dimensions: number }) {
         this.debug('Connecting to database');
-        await this.client.connect();
+        // Initialising again (e.g. a rebuilt app) must not take a second reference
+        if (!this.client) this.client = await acquireMongoClient(this.connectionString);
         const database = this.client.db(this.dbName);
         this.debug('Connected');
 
@@ -171,5 +174,12 @@ export class MongoDb implements BaseDb {
 
     async reset(): Promise<void> {
         await this.collection.deleteMany({});
+    }
+
+    /** Releases this store's share of the connection pool. */
+    async close(): Promise<void> {
+        if (!this.client) return;
+        this.client = null;
+        await releaseMongoClient(this.connectionString);
     }
 }

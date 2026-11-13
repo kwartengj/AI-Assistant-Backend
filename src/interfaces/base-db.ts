@@ -8,4 +8,6 @@ export interface BaseDb {
 
     deleteKeys(uniqueLoaderId: string): Promise<boolean>;
     reset(): Promise<void>;
+    /** Optional: release connections held by this store */
+    close?(): Promise<void>;
 }

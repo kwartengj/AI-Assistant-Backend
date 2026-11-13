@@ -1,11 +1,12 @@
 import { MongoClient } from 'mongodb';
 import { BaseCache } from '../interfaces/base-cache.js';
+import { acquireMongoClient, releaseMongoClient } from '../global/mongo-clients.js';
 
 export class MongoCache implements BaseCache {
     private readonly uri: string;
     private readonly dbName: string;
     private readonly collectionName: string;
-    private client: MongoClient;
+    private client: MongoClient | null = null;
 
     constructor({ uri, dbName, collectionName }: { uri: string, dbName: string, collectionName: string }) {
         this.uri = uri;
@@ -14,8 +15,7 @@ export class MongoCache implements BaseCache {
     }
 
     async init(): Promise<void> {
-        this.client = new MongoClient(this.uri);
-        await this.client.connect();
+        if (!this.client) this.client = await acquireMongoClient(this.uri);
 
         // Create index on loaderId field
         const collection = this.client.db(this.dbName).collection(this.collectionName);
@@ -84,6 +84,8 @@ export class MongoCache implements BaseCache {
     }
 
     async close(): Promise<void> {
-        await this.client.close();
+        if (!this.client) return;
+        this.client = null;
+        await releaseMongoClient(this.uri);
     }
 }

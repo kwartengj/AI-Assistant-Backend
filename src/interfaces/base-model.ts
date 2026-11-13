@@ -95,8 +95,7 @@ export abstract class BaseModel {
         sources: Sources[],
         chunkIds: string[],
     ): Promise<ConversationEntry> {
-        // Add user query to history
-        await BaseModel.conversations.addEntryToConversation(conversationId, {
+        const queryEntry: ConversationEntry = {
             _id: uuidv4(),
             timestamp: new Date(),
             content: {
@@ -105,7 +104,7 @@ export abstract class BaseModel {
             },
             sources: [],
             chunks: []
-        });
+        };
 
         const newEntry: ConversationEntry = {
             _id: uuidv4(),
@@ -117,8 +116,15 @@ export abstract class BaseModel {
             sources,
             chunks: chunkIds
         }
-        // Add AI response to history
-        await BaseModel.conversations.addEntryToConversation(conversationId, newEntry);
+
+        // Save the question and the answer together (one write when the store supports it)
+        const store = BaseModel.conversations;
+        if (store.addEntriesToConversation) {
+            await store.addEntriesToConversation(conversationId, [queryEntry, newEntry]);
+        } else {
+            await store.addEntryToConversation(conversationId, queryEntry);
+            await store.addEntryToConversation(conversationId, newEntry);
+        }
 
         return newEntry;
     }
