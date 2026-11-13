@@ -211,13 +211,4 @@ export class CosmosDb implements BaseDb {
             await this.bulkDeleteValuesByBatch(IDs);
         } else this.debug('Nothing to delete');
     }
-
-    async getFullText(): Promise<string> {
-        return 'CosmosDB doesnt support full text';
-    }
-
-    async getChunks(): Promise<ExtractChunkData[]> {
-        // Returning an empty array as cosmos does not support getting all chunks
-        return [];
-    }
 }

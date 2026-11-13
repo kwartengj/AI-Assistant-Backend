@@ -94,14 +94,4 @@ export class LanceDb implements BaseDb {
     async reset(): Promise<void> {
         await this.table.delete('id IS NOT NULL');
     }
-
-    async getFullText(): Promise<string> {
-        // Fetch and concatenate all stored chunks as full text
-        return 'lance-db does not support full text yet!';
-    }
-
-    async getChunks(): Promise<ExtractChunkData[]> {
-        // Returning an empty array as lance-db does not support getting all chunks
-        return [];
-    }
 }

@@ -109,17 +109,4 @@ Pinecone does not allow deleting by metadata filtering in serverless and free (w
     async reset(): Promise<void> {
         await this.client.Index(this.projectName).namespace(this.namespace).deleteAll();
     }
-
-    async getFullText(): Promise<string> {
-        // Fetch and concatenate all stored chunks as full text
-        return 'Pinecone does not support full text yet!';
-        // const index = this.client.Index(this.projectName).namespace(this.namespace);
-        // const allRecords = await index.query({ topK: 1000000, includeValues: true });   
-        // return allRecords.matches.map((record) => record.metadata.pageContent).join(' ');
-    }
-
-    async getChunks(): Promise<ExtractChunkData[]> {
-        // Returning an empty array as Pinecone does not support getting all chunks
-        return [];
-    }
 }

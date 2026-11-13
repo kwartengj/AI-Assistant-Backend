@@ -172,34 +172,4 @@ export class MongoDb implements BaseDb {
     async reset(): Promise<void> {
         await this.collection.deleteMany({});
     }
-    
-    async getFullText(): Promise<string> {
-        try {
-            const chunks = await this.collection.find().toArray();
-            const fullText = chunks.map(chunk => chunk.pageContent).join(' ');
-            return fullText;
-        } catch (error) {
-            this.debug('Error fetching chunks for full text:', error);
-            throw new Error('Failed to fetch and concatenate chunks');
-        }
-    }
-
-    async getChunks(): Promise<ExtractChunkData[]> {
-        try {
-            const chunks = await this.collection.find().toArray();
-            return chunks.map(chunk => ({
-                score: 0, // default if not used in similarity search
-                pageContent: chunk.pageContent,
-                metadata: {
-                    ...chunk.metadata,
-                    source: chunk.source,
-                    id: chunk[MongoDb.UNIQUE_FIELD_NAME],
-                    uniqueLoaderId: chunk[MongoDb.LOADER_FIELD_NAME],
-                },
-            }));
-        } catch (error) {
-            this.debug('Error fetching chunks:', error);
-            throw new Error('Failed to chunks');
-        }
-    }
 }
