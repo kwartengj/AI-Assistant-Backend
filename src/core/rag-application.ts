@@ -15,8 +15,14 @@ import { OpenAi3SmallEmbeddings } from '../index.js';
 import { InMemoryConversations } from '../conversations/memory-conversations.js';
 import { getUnique } from '../util/arrays.js';
 
-/** Filled in by getContext/getEmbeddings when passed: time spent embedding the query and searching. */
-export type RetrievalTimings = { embedMs?: number; searchMs?: number };
+/**
+ * Filled in by getContext/getEmbeddings when passed: time spent embedding the query and searching,
+ * and whether the query's embedding came from the cache.
+ */
+export type RetrievalTimings = { embedMs?: number; searchMs?: number; embedCached?: boolean };
+
+/** Recently embedded queries per application (repeated questions and suggestion prompts skip the API). */
+const QUERY_EMBEDDING_CACHE_SIZE = 500;
 
 export class RAGApplication {
     private readonly debug = createDebugMessages('embedjs:core');
@@ -26,6 +32,8 @@ export class RAGApplication {
     private readonly vectorDb: BaseDb;
     private readonly model: BaseModel;
     private readonly embeddingRelevanceCutOff: number;
+    // Insertion-ordered, so the first key is the least recently used
+    private readonly queryEmbeddings = new Map<string, number[]>();
 
     private readonly rawLoaders: LoaderParam[];
     private loaders: BaseLoader[];
@@ -324,7 +332,7 @@ export class RAGApplication {
      */
     public async getEmbeddings(cleanQuery: string, timings?: RetrievalTimings) {
         let started = Date.now();
-        const queryEmbedded = await RAGEmbedding.getEmbedding().embedQuery(cleanQuery);
+        const queryEmbedded = await this.embedQueryCached(cleanQuery, timings);
         if (timings) timings.embedMs = Date.now() - started;
         started = Date.now();
         const unfilteredResultSet = await this.vectorDb.similaritySearch(queryEmbedded, this.searchResultCount + 10);
@@ -334,6 +342,22 @@ export class RAGApplication {
             .filter((result) => result.score > this.embeddingRelevanceCutOff)
             .sort((a, b) => b.score - a.score)
             .slice(0, this.searchResultCount);
+    }
+
+    private async embedQueryCached(query: string, timings?: RetrievalTimings): Promise<number[]> {
+        const cached = this.queryEmbeddings.get(query);
+        if (timings) timings.embedCached = Boolean(cached);
+        if (cached) {
+            this.queryEmbeddings.delete(query);
+            this.queryEmbeddings.set(query, cached);
+            return cached;
+        }
+        const embedded = await RAGEmbedding.getEmbedding().embedQuery(query);
+        this.queryEmbeddings.set(query, embedded);
+        if (this.queryEmbeddings.size > QUERY_EMBEDDING_CACHE_SIZE) {
+            this.queryEmbeddings.delete(this.queryEmbeddings.keys().next().value);
+        }
+        return embedded;
     }
 
     /**
