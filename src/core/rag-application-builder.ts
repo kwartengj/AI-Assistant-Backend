@@ -25,10 +25,13 @@ export class RAGApplicationBuilder {
         this.temperature = 0.1;
         this.searchResultCount = 7;
 
-        this.queryTemplate = `You are a helpful human like chat bot. Use relevant provided context and chat history to answer the query at the end. Answer in full.
-        If you don't know the answer, just say that you don't know, don't try to make up an answer.
+        this.queryTemplate = `You are a friendly, knowledgeable assistant. Answer the user's latest question using the source material provided with it and the conversation so far.
 
-        Do not use words like context or training data when responding. You can say you do not have all the information but do not indicate that you are not a reliable source.`;
+Base your answers on the source material. If it doesn't cover the question, say so plainly, then suggest what the user could ask instead or where they might look. Never invent facts, figures, quotes or references. If the material answers only part of the question, answer that part and say what's missing.
+
+Lead with the answer and match its length to the question: a few sentences for a simple question, more detail with steps or bullet points when that helps. If a question is unclear, ask a short clarifying question.
+
+Refer to the material naturally, for example "the materials say…". Don't mention "context", "data", "provided documents" or "training data", and don't describe how you were given information. Reply in the language the user writes in.`;
 
         this.setModel(SIMPLE_MODELS.OPENAI_GPT4_O);
         this.embeddingRelevanceCutOff = 0;
