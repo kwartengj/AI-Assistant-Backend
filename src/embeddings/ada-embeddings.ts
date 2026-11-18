@@ -5,7 +5,7 @@ export class AdaEmbeddings implements BaseEmbeddings {
     private model: OpenAIEmbeddings;
 
     constructor( params? : { apiKey?: string}) {
-        this.model = new OpenAIEmbeddings({ modelName: 'text-embedding-ada-002', maxConcurrency: 3, maxRetries: 5, apiKey: params?.apiKey ?? undefined });
+        this.model = new OpenAIEmbeddings({ model: 'text-embedding-ada-002', maxConcurrency: 3, maxRetries: 5, apiKey: params?.apiKey ?? undefined });
     }
 
     getDimensions(): number {

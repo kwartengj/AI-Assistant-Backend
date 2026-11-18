@@ -1,4 +1,4 @@
-import { Document } from 'langchain/document';
+import { Document } from '@langchain/core/documents';
 
 import { Chunk } from '../global/types.js';
 import { BaseEmbeddings } from '../interfaces/base-embeddings.js';

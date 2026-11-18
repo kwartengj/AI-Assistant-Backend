@@ -1,5 +1,5 @@
 import createDebugMessages from 'debug';
-import { Ollama as ChatOllamaAI } from '@langchain/community/llms/ollama';
+import { Ollama as ChatOllamaAI } from '@langchain/ollama';
 import { AIMessage, HumanMessage, SystemMessage } from '@langchain/core/messages';
 
 import { Chunk, Message } from '../global/types.js';

@@ -1,5 +1,5 @@
 import createDebugMessages from 'debug';
-import { HuggingFaceInference } from '@langchain/community/llms/hf';
+import { InferenceClient } from '@huggingface/inference';
 
 import { BaseModel } from '../interfaces/base-model.js';
 import { Chunk, Message } from '../global/types.js';
@@ -11,7 +11,7 @@ export class HuggingFace extends BaseModel {
     private readonly maxNewTokens: number;
     private readonly endpointUrl?: string;
     private readonly apiKey?: string;
-    private model: HuggingFaceInference;
+    private client: InferenceClient;
 
     constructor(params?: { modelName?: string; temperature?: number; maxNewTokens?: number; endpointUrl?: string, apiKey?: string }) {
         super(params?.temperature);
@@ -23,15 +23,8 @@ export class HuggingFace extends BaseModel {
     }
 
     override async init(): Promise<void> {
-        this.model = new HuggingFaceInference({
-            model: this.modelName,
-            apiKey: this.apiKey,
-            maxTokens: this.maxNewTokens,
-            temperature: this.temperature,
-            endpointUrl: this.endpointUrl,
-            verbose: false,
-            maxRetries: 1,
-        });
+        // Called directly, so the library doesn't need @langchain/community just for this model
+        this.client = new InferenceClient(this.apiKey);
     }
 
     override async runQuery(
@@ -57,9 +50,12 @@ export class HuggingFace extends BaseModel {
 
         const finalPrompt = pastMessages.join('\n');
         // this.debug('Final prompt being sent to HF - ', finalPrompt);
-        this.debug(`Executing hugging face '${this.model.model}' model with prompt -`, userQuery);
-        const result = await this.model.invoke(finalPrompt);
+        this.debug(`Executing hugging face '${this.modelName}' model with prompt -`, userQuery);
+        const parameters = { max_new_tokens: this.maxNewTokens, temperature: this.temperature, return_full_text: false };
+        const result = this.endpointUrl
+            ? await this.client.endpoint(this.endpointUrl).textGeneration({ inputs: finalPrompt, parameters })
+            : await this.client.textGeneration({ model: this.modelName, inputs: finalPrompt, parameters });
         this.debug('Hugging response -', result);
-        return result;
+        return result.generated_text;
     }
 }

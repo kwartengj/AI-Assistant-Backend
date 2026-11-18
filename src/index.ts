@@ -16,8 +16,6 @@ import { BaseConversations } from './interfaces/base-conversations.js';
 import { InMemoryConversations } from './conversations/memory-conversations.js';
 import { MongoConversations } from './conversations/mongo-conversations.js';
 import { MongoCache } from './cache/mongo-cache.js';
-import { YoutubeChannelLoader } from './loaders/youtube-channel-loader.js';
-import { YoutubeSearchLoader } from './loaders/youtube-search-loader.js';
 import { SitemapLoader } from './loaders/sitemap-loader.js';
 import { CsvLoader } from './loaders/csv-loader.js';
 import { LocalPathLoader } from './loaders/local-path-loader.js';
@@ -56,8 +54,6 @@ export {
     LocalPathLoader,
     CsvLoader,
     YoutubeLoader,
-    YoutubeChannelLoader,
-    YoutubeSearchLoader,
     SitemapLoader,
     ConfluenceLoader,
     BaseDb,

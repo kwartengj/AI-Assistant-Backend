@@ -22,7 +22,7 @@ export class OpenAi extends BaseModel {
     }
 
     override async init(): Promise<void> {
-        this.model = new ChatOpenAI({ temperature: this.temperature, model: this.modelName, apiKey : this.apiKey }, this.baseURL ? { baseURL: this.baseURL } : {});
+        this.model = new ChatOpenAI({ temperature: this.temperature, model: this.modelName, apiKey: this.apiKey, ...(this.baseURL ? { configuration: { baseURL: this.baseURL } } : {}) });
     }
 
     private buildMessages(

@@ -11,8 +11,6 @@ import { PptLoader } from '../loaders/ppt-loader.js';
 import { TextLoader } from '../loaders/text-loader.js';
 import { SitemapLoader } from '../loaders/sitemap-loader.js';
 import { ConfluenceLoader } from '../loaders/confluence-loader.js';
-import { YoutubeChannelLoader } from '../loaders/youtube-channel-loader.js';
-import { YoutubeSearchLoader } from '../loaders/youtube-search-loader.js';
 import { YoutubeLoader } from '../loaders/youtube-loader.js';
 import { BaseLoader } from '../interfaces/base-loader.js';
 import { JsonLoader } from '../loaders/json-loader.js';
@@ -32,9 +30,7 @@ export type LoaderParam =
     | ({ type: 'Ppt' } & ConstructorParameters<typeof PptLoader>[0])
     | ({ type: 'Sitemap' } & ConstructorParameters<typeof SitemapLoader>[0])
     | ({ type: 'Text' } & ConstructorParameters<typeof TextLoader>[0])
-    | ({ type: 'YoutubeChannel' } & ConstructorParameters<typeof YoutubeChannelLoader>[0])
     | ({ type: 'Youtube' } & ConstructorParameters<typeof YoutubeLoader>[0])
-    | ({ type: 'YoutubeSearch' } & ConstructorParameters<typeof YoutubeSearchLoader>[0])
     | ({ type: 'LocalPath' } & ConstructorParameters<typeof LocalPathLoader>[0])
     | ({ type: 'Url' } & ConstructorParameters<typeof UrlLoader>[0])
     | ({ type: 'Csv' } & ConstructorParameters<typeof CsvLoader>[0]);
@@ -115,12 +111,8 @@ export class DynamicLoader {
                     return new SitemapLoader(loader);
                 case 'Text':
                     return new TextLoader(loader);
-                case 'YoutubeChannel':
-                    return new YoutubeChannelLoader(loader);
                 case 'Youtube':
                     return new YoutubeLoader(loader);
-                case 'YoutubeSearch':
-                    return new YoutubeSearchLoader(loader);
                 case 'LocalPath':
                     return new LocalPathLoader(loader);
                 case 'Url':

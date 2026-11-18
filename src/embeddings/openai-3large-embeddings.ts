@@ -9,7 +9,7 @@ export class OpenAi3LargeEmbeddings implements BaseEmbeddings {
         this.dynamicDimension = params?.dynamicDimension ?? 3072;
 
         this.model = new OpenAIEmbeddings({
-            modelName: 'text-embedding-3-large',
+            model: 'text-embedding-3-large',
             maxConcurrency: 3,
             maxRetries: 5,
             dimensions: this.dynamicDimension,
